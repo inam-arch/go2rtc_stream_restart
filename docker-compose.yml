@@ -1,0 +1,27 @@
+services:
+  go2rtc:
+    image: registry.gitlab.com/cowlar/embedded/vimba-gstreamer-webrtc:go2rtc-0.0.1
+    container_name: go2rtc
+    restart: unless-stopped
+    volumes:
+      - ./go2rtc.yaml:/src/go2rtc.yaml
+      - ./manage-streams.sh:/src/manage-streams.sh
+    environment:
+      - TZ=UTC
+    ports:
+      - "1984:1984"    # API / Web UI
+      - "8554:8554"    # RTSP
+      - "8555:8555/tcp"  # WebRTC TCP
+      - "8555:8555/udp"  # WebRTC UDP
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:1984/api/streams"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - go2rtc-network
+
+networks:
+  go2rtc-network:
+    driver: bridge
