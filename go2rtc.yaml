@@ -20,5 +20,6 @@ log:
 
 streams:
   camera2:
+    - camera2
   camera1:
     - camera1
