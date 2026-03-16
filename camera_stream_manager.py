@@ -58,6 +58,7 @@ class CameraState:
     healthy: bool = False
     unhealthy_streak: int = 0
     healthy_streak: int = 0
+    device_path: str = ""  # PNP path — unique per physical USB port
     lock: threading.Lock = field(default_factory=threading.Lock)
     cooldown_until: float = 0.0  # timestamp — watchdog skips this camera until then
 
@@ -116,13 +117,16 @@ class CameraStreamManager:
             logger.error("[StreamManager] go2rtc API not reachable — is Docker running?")
             return
 
-        # Initial device scan
-        device_counts = self._scan_connected_devices()
-        logger.info(f"[StreamManager] Initial device scan: {device_counts}")
+        # Initial device scan — discover PNP paths for each physical camera
+        device_map = self._scan_connected_devices()
+        logger.info(f"[StreamManager] Initial device scan: { {k: len(v) for k, v in device_map.items()} }")
+
+        # Assign each camera to a unique PNP path based on device_number order
+        self._assign_device_paths(device_map)
 
         # Start streams for cameras whose devices are present
         for name, state in self._states.items():
-            if self._is_device_available(state.config, device_counts):
+            if state.device_path:
                 state.is_connected = True
                 self.start_stream(name)
             else:
@@ -169,13 +173,22 @@ class CameraStreamManager:
             cfg = state.config
             rtsp_url = f"{self.rtsp_server}/{camera_name}"
 
+            # Use PNP path (unique per USB port) so each ffmpeg grabs
+            # exactly the right physical camera regardless of enumeration order.
+            if state.device_path:
+                input_args = ["-i", f"video={state.device_path}"]
+            else:
+                input_args = [
+                    "-video_device_number", str(cfg.device_number),
+                    "-i", f"video={cfg.device_name}",
+                ]
+
             cmd = [
                 "ffmpeg",
                 "-f", "dshow",
                 "-video_size", cfg.video_size,
                 "-framerate", str(cfg.framerate),
-                "-video_device_number", str(cfg.device_number),
-                "-i", f"video={cfg.device_name}",
+                *input_args,
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
                 "-tune", "zerolatency",
@@ -331,13 +344,14 @@ class CameraStreamManager:
 
     # ── Device scanning (DirectShow via ffmpeg) ─────────────────────────
 
-    def _scan_connected_devices(self) -> dict[str, int]:
+    def _scan_connected_devices(self) -> dict[str, list[str]]:
         """
         Enumerate DirectShow video devices via ffmpeg.
-        Returns dict mapping device name -> number of instances connected.
-        Example: {"c922 Pro Stream Webcam": 2}
+        Returns dict mapping device name -> list of PNP paths.
+        Example: {"c922 Pro Stream Webcam": ["@device_pnp_...", "@device_pnp_..."]}
+        Each PNP path uniquely identifies a physical camera by USB port.
         """
-        devices: dict[str, int] = {}
+        devices: dict[str, list[str]] = {}
         try:
             result = subprocess.run(
                 ["ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
@@ -347,75 +361,98 @@ class CameraStreamManager:
                 creationflags=_CREATION_FLAGS,
             )
             output = result.stderr
-            # Match lines like:  [in#0 @ ADDR] "Device Name" (video)
-            # or older format:   [dshow @ ADDR] "Device Name" (video)
+            current_video_device: Optional[str] = None
             for line in output.split("\n"):
-                # Skip "Alternative name" lines
                 if "Alternative name" in line:
-                    continue
-                match = re.search(r'"(.+?)"\s*\(video\)', line)
-                if match:
-                    name = match.group(1)
-                    devices[name] = devices.get(name, 0) + 1
+                    match = re.search(r'"(.+?)"', line)
+                    if match and current_video_device is not None:
+                        path = match.group(1)
+                        devices.setdefault(current_video_device, []).append(path)
+                    current_video_device = None
+                else:
+                    match = re.search(r'"(.+?)"\s*\(video\)', line)
+                    if match:
+                        current_video_device = match.group(1)
         except Exception as e:
             logger.error(f"[StreamManager] Device scan failed: {e}")
         return devices
 
-    @staticmethod
-    def _is_device_available(config: CameraConfig, device_counts: dict[str, int]) -> bool:
-        """A camera is available when enough instances of its device are present."""
-        count = device_counts.get(config.device_name, 0)
-        return count > config.device_number
+    def _assign_device_paths(self, device_map: dict[str, list[str]]):
+        """Assign PNP paths to cameras based on device_number ordering.
+        device_number=0 → first PNP path, device_number=1 → second, etc."""
+        by_device: dict[str, list[CameraState]] = {}
+        for state in self._states.values():
+            by_device.setdefault(state.config.device_name, []).append(state)
+
+        for device_name, states in by_device.items():
+            paths = device_map.get(device_name, [])
+            states.sort(key=lambda s: s.config.device_number)
+            for state in states:
+                idx = state.config.device_number
+                if idx < len(paths):
+                    state.device_path = paths[idx]
+                    logger.info(
+                        f"[StreamManager] {state.config.name} -> "
+                        f"...{state.device_path[-50:]}"
+                    )
+                else:
+                    state.device_path = ""
 
     # ── Hotplug loop ────────────────────────────────────────────────────
 
     def _hotplug_loop(self):
-        """Periodically scan devices and react to connect/disconnect events."""
-        previous_counts: dict[str, int] = self._scan_connected_devices()
-
+        """Periodically scan devices and react to connect/disconnect events.
+        Uses PNP paths to uniquely identify cameras — disconnecting one
+        camera never affects the other."""
         while self._running:
             time.sleep(self.hotplug_scan_interval)
             if not self._running:
                 break
 
-            current_counts = self._scan_connected_devices()
+            device_map = self._scan_connected_devices()
 
             for name, state in self._states.items():
-                was_available = self._is_device_available(state.config, previous_counts)
-                now_available = self._is_device_available(state.config, current_counts)
+                current_paths = device_map.get(state.config.device_name, [])
 
-                if now_available and not was_available:
-                    # ── Device connected ──
-                    logger.info(f"[Hotplug] {name} device connected")
-                    state.is_connected = True
-                    state.restart_count = 0  # Reset budget on fresh plug-in
-                    state.unhealthy_streak = 0
-                    # Set cooldown so watchdog doesn't race us
-                    state.cooldown_until = time.time() + 15
-                    logger.info(f"[Hotplug] {name} waiting 5s for device to initialise...")
-                    time.sleep(5)  # USB devices need time to settle
-                    self.stop_stream(name)  # Kill any zombie ffmpeg
-                    time.sleep(1)
-                    self.start_stream(name)
-                    if self.on_camera_connected:
-                        try:
-                            self.on_camera_connected(name)
-                        except Exception as e:
-                            logger.error(f"[Hotplug] on_camera_connected callback error: {e}")
-
-                elif was_available and not now_available:
-                    # ── Device disconnected ──
-                    logger.warning(f"[Hotplug] {name} device disconnected")
-                    state.is_connected = False
-                    state.cooldown_until = time.time() + 10  # Prevent watchdog restarts
-                    self.stop_stream(name)
-                    if self.on_camera_disconnected:
-                        try:
-                            self.on_camera_disconnected(name)
-                        except Exception as e:
-                            logger.error(f"[Hotplug] on_camera_disconnected callback error: {e}")
-
-            previous_counts = current_counts
+                if state.device_path:
+                    # ── Camera has an assigned PNP path — check if still present ──
+                    if state.device_path not in current_paths:
+                        logger.warning(f"[Hotplug] {name} device disconnected")
+                        state.is_connected = False
+                        state.device_path = ""
+                        state.cooldown_until = time.time() + 10
+                        self.stop_stream(name)
+                        if self.on_camera_disconnected:
+                            try:
+                                self.on_camera_disconnected(name)
+                            except Exception as e:
+                                logger.error(f"[Hotplug] on_camera_disconnected callback error: {e}")
+                else:
+                    # ── Camera has no path — look for a newly plugged device ──
+                    assigned_paths = {
+                        s.device_path for s in self._states.values() if s.device_path
+                    }
+                    available = [p for p in current_paths if p not in assigned_paths]
+                    if available:
+                        state.device_path = available[0]
+                        logger.info(
+                            f"[Hotplug] {name} device connected "
+                            f"(path: ...{state.device_path[-50:]})"
+                        )
+                        state.is_connected = True
+                        state.restart_count = 0
+                        state.unhealthy_streak = 0
+                        state.cooldown_until = time.time() + 15
+                        logger.info(f"[Hotplug] {name} waiting 5s for device to initialise...")
+                        time.sleep(5)
+                        self.stop_stream(name)  # Kill any zombie ffmpeg
+                        time.sleep(1)
+                        self.start_stream(name)
+                        if self.on_camera_connected:
+                            try:
+                                self.on_camera_connected(name)
+                            except Exception as e:
+                                logger.error(f"[Hotplug] on_camera_connected callback error: {e}")
 
     # ── Watchdog loop ───────────────────────────────────────────────────
 
