@@ -19,7 +19,9 @@ Usage:
     manager.start()
 """
 
+import glob
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -29,6 +31,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import requests
+
+_IS_LINUX = sys.platform == "linux"
 
 logger = logging.getLogger(__name__)
 
@@ -178,33 +182,53 @@ class CameraStreamManager:
             cfg = state.config
             rtsp_url = f"{self.rtsp_server}/{camera_name}"
 
-            # Use PNP path (unique per USB port) so each ffmpeg grabs
-            # exactly the right physical camera regardless of enumeration order.
-            if state.device_path:
-                input_args = ["-i", f"video={state.device_path}"]
-            else:
-                input_args = [
-                    "-video_device_number", str(cfg.device_number),
-                    "-i", f"video={cfg.device_name}",
+            if _IS_LINUX:
+                # Linux: use v4l2 with /dev/videoN device path
+                device = state.device_path or f"/dev/video{cfg.device_number}"
+                cmd = [
+                    "ffmpeg",
+                    "-f", "v4l2",
+                    "-video_size", cfg.video_size,
+                    "-framerate", str(cfg.framerate),
+                    "-i", device,
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-tune", "zerolatency",
+                    "-b:v", cfg.bitrate,
+                    "-g", "60",
+                    "-pix_fmt", "yuv420p",
+                    "-an",
+                    "-f", "rtsp",
+                    "-rtsp_transport", "tcp",
+                    rtsp_url,
                 ]
+            else:
+                # Windows: use DirectShow with PNP path or device name
+                if state.device_path:
+                    input_args = ["-i", f"video={state.device_path}"]
+                else:
+                    input_args = [
+                        "-video_device_number", str(cfg.device_number),
+                        "-i", f"video={cfg.device_name}",
+                    ]
 
-            cmd = [
-                "ffmpeg",
-                "-f", "dshow",
-                "-video_size", cfg.video_size,
-                "-framerate", str(cfg.framerate),
-                *input_args,
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-                "-b:v", cfg.bitrate,
-                "-g", "60",
-                "-pix_fmt", "yuv420p",
-                "-an",
-                "-f", "rtsp",
-                "-rtsp_transport", "tcp",
-                rtsp_url,
-            ]
+                cmd = [
+                    "ffmpeg",
+                    "-f", "dshow",
+                    "-video_size", cfg.video_size,
+                    "-framerate", str(cfg.framerate),
+                    *input_args,
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-tune", "zerolatency",
+                    "-b:v", cfg.bitrate,
+                    "-g", "60",
+                    "-pix_fmt", "yuv420p",
+                    "-an",
+                    "-f", "rtsp",
+                    "-rtsp_transport", "tcp",
+                    rtsp_url,
+                ]
 
             try:
                 log_path = f"ffmpeg-{camera_name}.log"
@@ -351,15 +375,50 @@ class CameraStreamManager:
             pass
         return False
 
-    # ── Device scanning (DirectShow via ffmpeg) ─────────────────────────
+    # ── Device scanning ─────────────────────────────────────────────────
 
     def _scan_connected_devices(self) -> dict[str, list[str]]:
         """
-        Enumerate DirectShow video devices via ffmpeg.
-        Returns dict mapping device name -> list of PNP paths.
-        Example: {"c922 Pro Stream Webcam": ["@device_pnp_...", "@device_pnp_..."]}
-        Each PNP path uniquely identifies a physical camera by USB port.
+        Enumerate video capture devices.
+
+        Windows: Uses DirectShow via ffmpeg -list_devices.
+                 Returns {device_name: [pnp_path, ...]}.
+        Linux:   Scans /dev/video* with v4l2-ctl.
+                 Returns {device_name: ["/dev/video0", ...]}.
         """
+        if _IS_LINUX:
+            return self._scan_v4l2_devices()
+        return self._scan_dshow_devices()
+
+    def _scan_v4l2_devices(self) -> dict[str, list[str]]:
+        """Scan V4L2 video capture devices on Linux."""
+        devices: dict[str, list[str]] = {}
+        for dev_path in sorted(glob.glob("/dev/video*")):
+            try:
+                # Check if this is a video capture device (not metadata)
+                result = subprocess.run(
+                    ["v4l2-ctl", "--device", dev_path, "--all"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                output = result.stdout
+                # Only include devices that support Video Capture
+                if "Video Capture" not in output:
+                    continue
+                # Extract device name ("Card type" line)
+                name_match = re.search(r"Card type\s*:\s*(.+)", output)
+                if name_match:
+                    name = name_match.group(1).strip()
+                    devices.setdefault(name, []).append(dev_path)
+            except FileNotFoundError:
+                # v4l2-ctl not installed — fall back to listing /dev/video* that exist
+                if os.path.exists(dev_path):
+                    devices.setdefault("unknown", []).append(dev_path)
+            except Exception:
+                continue
+        return devices
+
+    def _scan_dshow_devices(self) -> dict[str, list[str]]:
+        """Scan DirectShow video devices on Windows via ffmpeg."""
         devices: dict[str, list[str]] = {}
         try:
             result = subprocess.run(
@@ -387,14 +446,25 @@ class CameraStreamManager:
         return devices
 
     def _assign_device_paths(self, device_map: dict[str, list[str]]):
-        """Assign PNP paths to cameras based on device_number ordering.
-        device_number=0 → first PNP path, device_number=1 → second, etc."""
+        """Assign device paths to cameras based on device_number ordering.
+        Windows: device_number=0 → first PNP path, 1 → second, etc.
+        Linux:   device_number=0 → first /dev/videoN, 1 → second, etc."""
         by_device: dict[str, list[CameraState]] = {}
         for state in self._states.values():
             by_device.setdefault(state.config.device_name, []).append(state)
 
+        # On Linux, if device_name doesn't match any v4l2 card name,
+        # try matching all detected devices as a fallback
+        all_paths: list[str] = []
+        if _IS_LINUX:
+            for paths in device_map.values():
+                all_paths.extend(paths)
+
         for device_name, states in by_device.items():
             paths = device_map.get(device_name, [])
+            # Linux fallback: if no exact name match, use all detected devices
+            if not paths and _IS_LINUX:
+                paths = all_paths
             states.sort(key=lambda s: s.config.device_number)
             for state in states:
                 idx = state.config.device_number
@@ -402,7 +472,7 @@ class CameraStreamManager:
                     state.device_path = paths[idx]
                     logger.info(
                         f"[StreamManager] {state.config.name} -> "
-                        f"...{state.device_path[-50:]}"
+                        f"{state.device_path}"
                     )
                 else:
                     state.device_path = ""

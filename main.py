@@ -13,10 +13,12 @@ Run:
 import logging
 import os
 import sys
+import threading
 import time
 
 from camera_stream_manager import CameraStreamManager, CameraConfig
 from frame_handler import FrameHandler
+from stream_camera import StreamGUI
 
 logging.basicConfig(
     level=logging.INFO,
@@ -120,17 +122,19 @@ def main():
     else:
         logger.info("[Main] HID reader skipped (Windows — evdev is Linux only)")
 
-    # ── 4. Run: periodic frame grab test + keep alive ───────────────────
-    logger.info("=== All components running — press Ctrl+C to stop ===")
+    # ── 4. Background keep-alive / status loop ──────────────────────────
+    logger.info("=== All components running ===")
     os.makedirs("test_frames", exist_ok=True)
+    _shutdown = threading.Event()
 
-    try:
+    def _keep_alive():
         cycle = 0
-        while True:
-            time.sleep(5)
+        while not _shutdown.is_set():
+            _shutdown.wait(5)
+            if _shutdown.is_set():
+                break
             cycle += 1
 
-            # Every 10 cycles (50s), grab and save a test frame from each camera
             if cycle % 10 == 1:
                 for cam_name, fh in frame_handlers.items():
                     frame = fh.getFrame()
@@ -141,7 +145,6 @@ def main():
                     else:
                         logger.warning(f"[Main] {cam_name} returned no frame")
 
-            # Print status summary
             status_parts = []
             for cam_name in CAMERAS:
                 state = manager.get_state(cam_name)
@@ -156,18 +159,33 @@ def main():
                     )
             logger.info(f"[Status] {' | '.join(status_parts)}")
 
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-    finally:
-        # Clean up
-        for cam_name, fh in frame_handlers.items():
-            logger.info(f"[Main] Releasing FrameHandler for {cam_name}")
-            fh.release()
-        manager.stop()
-        if hid_reader and hid_reader.is_alive():
-            hid_reader.terminate()
-            hid_reader.join(timeout=5)
-        logger.info("=== Shutdown complete ===")
+    threading.Thread(target=_keep_alive, daemon=True, name="KeepAlive").start()
+
+    # ── 5. Launch GUI on main thread (tkinter requires main thread on Windows)
+    gui = None
+    if frame_handlers:
+        gui = StreamGUI(frame_handlers)
+        logger.info("[Main] Opening stream viewer — close the window to stop")
+        gui.start()  # blocks until window is closed
+    else:
+        logger.warning("[Main] No frame handlers — running headless (Ctrl+C to stop)")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+
+    logger.info("Shutting down...")
+    _shutdown.set()
+    # Clean up
+    for cam_name, fh in frame_handlers.items():
+        logger.info(f"[Main] Releasing FrameHandler for {cam_name}")
+        fh.release()
+    manager.stop()
+    if hid_reader and hid_reader.is_alive():
+        hid_reader.terminate()
+        hid_reader.join(timeout=5)
+    logger.info("=== Shutdown complete ===")
 
 
 if __name__ == "__main__":
