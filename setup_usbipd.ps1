@@ -30,10 +30,20 @@
     Docs: https://learn.microsoft.com/en-us/windows/wsl/connect-usb
 #>
 
-#Requires -RunAsAdministrator
-
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Continue"
+
+# ── auto-elevate if not already running as Administrator ──────────────────────
+if (-not ([Security.Principal.WindowsPrincipal] `
+        [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+
+    Write-Host "[usbipd] Re-launching as Administrator (UAC prompt will appear)..." -ForegroundColor Yellow
+    Start-Process powershell.exe -ArgumentList `
+        "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" `
+        -Verb RunAs
+    exit
+}
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -137,11 +147,17 @@ foreach ($dev in $videoDevices) {
     }
 
     # --- attach to WSL --------------------------------------------------------
-    Write-Host "[usbipd] Attaching $busId to WSL ..." -ForegroundColor Green
-    $out = usbipd attach --wsl --busid $busId 2>&1
+    # --force detaches the device from Windows drivers first (needed when the
+    # webcam is "Shared/Attached" but still held by a Windows process such as
+    # the Logitech service or a previous attach session).
+    Write-Host "[usbipd] Attaching $busId to WSL (--force) ..." -ForegroundColor Green
+    $out = usbipd attach --wsl --force --busid $busId 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  ATTACH FAILED: $out" -ForegroundColor Red
-        Write-Host "  Make sure a WSL2 terminal is open and try again." -ForegroundColor Yellow
+        Write-Host "  Tips:" -ForegroundColor Yellow
+        Write-Host "    • Make sure a WSL2 terminal is running (wsl -d Ubuntu-22.04)" -ForegroundColor Yellow
+        Write-Host "    • Kill any Windows app holding the camera (Logi Capture, Camera app, etc.)" -ForegroundColor Yellow
+        Write-Host "    • Manual fallback: usbipd attach --wsl --force --busid $busId" -ForegroundColor Cyan
     } else {
         if ($out) { $out | ForEach-Object { Write-Host "  $_" } }
         Write-Host "  OK" -ForegroundColor Green

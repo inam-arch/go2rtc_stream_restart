@@ -1,8 +1,14 @@
-# go2rtc configuration — real webcam streaming
-# Two C922 Pro Stream Webcams on Windows push RTSP into go2rtc in Docker.
-# ffmpeg runs on the Windows host (Docker on Windows cannot access USB cameras).
-# ffmpeg pushes to rtsp://localhost:8554/camera1 and camera2.
-# go2rtc accepts the pushed RTSP streams and serves them via WebRTC/HLS/RTSP.
+# go2rtc configuration — Windows webcam streaming via RTSP push
+#
+# Flow:
+#   Webcam (Windows) → ffmpeg (Windows) → RTSP push → go2rtc (Docker)
+#
+# stream_camera.py on Windows runs:
+#   ffmpeg -f dshow -i video="c922 Pro Stream Webcam" ... rtsp://localhost:8554/camera1
+#
+# go2rtc listens on :8554 and accepts the incoming RTSP publish automatically.
+# No pull source is needed — the stream slot is pre-declared so the API and
+# WebRTC/HLS endpoints are ready before ffmpeg connects.
 
 api:
   listen: ":1984"
@@ -19,7 +25,7 @@ log:
   level: info
 
 streams:
-  camera1:
-    - camera1
-  camera2:
-    - camera2
+  # Pre-declare slots so the Web UI and API show the stream names.
+  # ffmpeg pushes RTSP here; go2rtc re-serves via RTSP / WebRTC / HLS.
+  camera1: []
+  camera2: []

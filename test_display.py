@@ -15,6 +15,8 @@ then run:
 Requirements: pillow, numpy, opencv-python
 """
 
+import os
+import re
 import time
 import tkinter as tk
 
@@ -26,7 +28,24 @@ from frame_handler import FrameHandlerWatchdog, StreamState
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-RTSP_BASE = "rtsp://localhost:8554"
+def _rtsp_host() -> str:
+    """Return the go2rtc host.
+    On Windows: localhost.
+    On WSL2 (NAT mode): read Windows host IP from /etc/resolv.conf.
+    On WSL2 (mirrored mode): localhost also works.
+    """
+    if os.path.exists("/etc/resolv.conf") and not os.path.exists("C:/Windows"):
+        try:
+            with open("/etc/resolv.conf") as fh:
+                for line in fh:
+                    m = re.match(r"nameserver\s+(\S+)", line)
+                    if m:
+                        return m.group(1)
+        except OSError:
+            pass
+    return "localhost"
+
+RTSP_BASE = f"rtsp://{_rtsp_host()}:8554"
 
 # RTSP URLs — go2rtc exposes each stream on port 8554/<stream_name>.
 # cv2.VideoCapture handles RTSP natively on Windows via the FFmpeg backend.
