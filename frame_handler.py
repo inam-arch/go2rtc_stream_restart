@@ -1,12 +1,24 @@
+import enum
 import logging
+import queue as _queue_module
 import threading
 from flask_socketio import SocketIO
 import cv2
 import datetime
 import ffmpegcv
 import math
+import numpy as _np
 import pytz
 import time
+
+
+class StreamState(enum.Enum):
+    """Observable lifecycle state of a single stream slot inside FrameHandlerWatchdog."""
+    INITIALIZING  = "initializing"   # handler being created for the first time
+    LIVE          = "live"           # frames flowing normally
+    CRASHED       = "crashed"        # frames went stale — watchdog is restarting
+    DISCONNECTED  = "disconnected"   # physical unplug detected — not retrying
+    RECONNECTING  = "reconnecting"   # plug-in detected — creating new handler
 
 class FrameHandler:
     LATEST_FRAME_TIMEOUT = 1 # seconds
@@ -21,11 +33,17 @@ class FrameHandler:
             enableResize: bool = False,
             videoFPS: int = 30,
             imageResolution: tuple[int, int] = (2464, 2056),
-            videoResolution: tuple[int, int] = (640, 540)
+            videoResolution: tuple[int, int] = (640, 540),
+            max_retries: int = 5,
             ):
         """
         cameraServerLink should be the MJPEG stream URL (not the HTML page).
         Example: http://localhost:1984/api/stream.mjpeg?src=inspect
+
+        max_retries: Number of open attempts before raising RuntimeError.
+            Use the default (5) for direct/standalone construction.
+            The watchdog passes 1 so it fails fast and relies on its own
+            check_interval for retry pacing.
         """
         self.flaskSocketIo = flaskSocketIo
         self.channelName = channelName
@@ -45,42 +63,49 @@ class FrameHandler:
         self.last_timestamp = None
         self.videoSavingLoop: threading.Thread | None = None
 
-        # CAP_PROP_READ_TIMEOUT_MSEC=5000 makes cap.read() return False within
-        # 5 s on a dead/silent stream so the reader thread can exit cleanly.
-        # On a live 30 fps stream each frame arrives in ~33 ms, so this timeout
-        # never fires during normal operation.
-        # CAP_PROP_OPEN_TIMEOUT_MSEC=5000 limits the initial connection attempt.
-        # Both are passed as constructor params (apiPreference=CAP_FFMPEG).
-        _cap_params = [
-            int(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC), 5_000,
-            int(cv2.CAP_PROP_READ_TIMEOUT_MSEC), 5_000,
-        ]
-        max_retries = 5
-        retry_delay = 1
-        for attempt in range(1, max_retries + 1):
-            self.cap = cv2.VideoCapture(self.camera_server_link, cv2.CAP_FFMPEG, _cap_params)
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            if self.cap.isOpened():
-                break
-            else:
-                self.cap.release()
-                if attempt < max_retries:
-                    print(f"[FrameHandler] Attempt {attempt} failed to open MJPEG stream. Retrying in {retry_delay}s...")
-                    time.sleep(retry_delay)
+        self._is_http = self.camera_server_link.startswith(("http://", "https://"))
+
+        if self._is_http:
+            # HTTP/MJPEG: go2rtc holds the HTTP connection open even with no
+            # active publisher.  We use requests streaming to read frames
+            # directly — no cv2.VideoCapture needed at init time and no
+            # FFmpeg async_lock concerns.
+            self.cap = None
+        else:
+            # RTSP / other protocols: use cv2.VideoCapture with FFmpeg backend.
+            # CAP_PROP_OPEN_TIMEOUT_MSEC limits the initial TCP/RTSP handshake.
+            # CAP_PROP_READ_TIMEOUT_MSEC makes cap.read() return False within
+            # 5 s on a dead stream so the reader thread exits cleanly.
+            _cap_params = [
+                int(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC), 5_000,
+                int(cv2.CAP_PROP_READ_TIMEOUT_MSEC), 5_000,
+            ]
+            retry_delay = 1
+            for attempt in range(1, max_retries + 1):
+                self.cap = cv2.VideoCapture(self.camera_server_link, cv2.CAP_FFMPEG, _cap_params)
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                if self.cap.isOpened():
+                    break
                 else:
-                    raise RuntimeError(f"Failed to open MJPEG stream at {self.camera_server_link} after {max_retries} attempts.")
+                    self.cap.release()
+                    if attempt < max_retries:
+                        print(f"[FrameHandler] Attempt {attempt} failed to open stream. Retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                    else:
+                        raise RuntimeError(f"Failed to open stream at {self.camera_server_link} after {max_retries} attempts.")
 
         self.latest_frame = None
         self.is_latest_frame_available = False
         self.last_received_time: float = time.monotonic()
         self.frame_lock = threading.Lock()
         self.running = True
-        self.reader_thread = threading.Thread(target=self._reader, daemon=True, name="MJPEGReader")
+        _target = self._reader_http if self._is_http else self._reader
+        self.reader_thread = threading.Thread(target=_target, daemon=True, name="MJPEGReader")
         self.reader_thread.start()
 
     def _reader(self):
         """
-        Continuously grab frames and keep only the latest one.
+        cv2.VideoCapture reader for RTSP / non-HTTP streams.
         Owns and releases self.cap — cap.release() is NEVER called from
         outside this thread to avoid the FFmpeg async_lock race condition.
         """
@@ -102,6 +127,49 @@ class FrameHandler:
                 self.cap.release()
             except Exception:
                 pass
+
+    def _reader_http(self) -> None:
+        """
+        cv2.VideoCapture reader for HTTP/MJPEG streams.
+
+        Runs entirely inside the reader thread so __init__ always succeeds
+        even when no publisher is active.  The open attempt is retried every
+        2 s until go2rtc has an active producer — once opened, frames flow
+        via the same cap.read() path as the RTSP reader.
+
+        cap is a local variable — released in the finally block of the inner
+        try, so there is no async_lock race with any other thread.
+        """
+        _cap_params = [
+            int(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC), 5_000,
+            int(cv2.CAP_PROP_READ_TIMEOUT_MSEC), 5_000,
+        ]
+        while self.running:
+            cap = cv2.VideoCapture(self.camera_server_link, cv2.CAP_FFMPEG, _cap_params)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if not cap.isOpened():
+                cap.release()
+                if self.running:
+                    time.sleep(2)   # no publisher yet — wait and retry
+                continue
+            # Capture opened — stream frames until it stops delivering
+            try:
+                while self.running:
+                    ret, frame = cap.read()
+                    if ret:
+                        with self.frame_lock:
+                            self.latest_frame = frame
+                            self.is_latest_frame_available = True
+                            self.last_received_time = time.monotonic()
+                    elif self.running:
+                        # Read failure — stream may have dropped; re-open.
+                        time.sleep(0.05)
+                        break
+            finally:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
 
     def savingLoop(self):
         try:
@@ -203,10 +271,15 @@ class FrameHandler:
     def release(self):
         """
         Signal the reader thread to stop and wait for it to exit.
-        cap.release() is called by the reader thread itself (in its finally
-        block) — never from here — to eliminate the async_lock race.
-        With CAP_PROP_READ_TIMEOUT_MSEC=5000 the blocking cap.read() will
-        return within 5 s, so the join completes quickly.
+
+        For RTSP streams: cap.release() is called by the reader thread itself
+        (in its finally block) — never from here — to eliminate the async_lock
+        race.  With CAP_PROP_READ_TIMEOUT_MSEC=5000 the blocking cap.read()
+        returns within 5 s, so the join completes quickly.
+
+        For HTTP/MJPEG streams: the requests reader uses timeout=(5, 2), so
+        iter_content() unblocks within 2 s of self.running being set False.
+        self.cap is None for HTTP streams (no VideoCapture involved).
         """
         self.running = False
         if self.reader_thread.is_alive():
@@ -250,40 +323,6 @@ _watchdog_logger = logging.getLogger("FrameHandlerWatchdog")
 
 
 class FrameHandlerWatchdog:
-    """
-    Monitors a pool of FrameHandlers and automatically restarts any that stop
-    delivering frames (stream crash) or fail to open (hotplug disconnect).
-
-    Does NOT modify FrameHandler — wraps it externally.
-
-    Crash detection: if getFrame() returns None for longer than `stale_timeout`
-    seconds, the handler is considered dead.  The watchdog calls release() on
-    it, then constructs a fresh FrameHandler on the same URL.
-
-    Hotplug detection: if FrameHandler.__init__ raises RuntimeError (camera not
-    reachable), the slot is marked None and retried every `check_interval`
-    seconds until the camera comes back.
-
-    Args:
-        streams        : {camera_name: url}  — one entry per camera.
-        stale_timeout  : Seconds without a frame before declaring dead (default 10).
-        check_interval : Watchdog polling period in seconds (default 3).
-        on_restart     : Optional callable(camera_name) called after a successful restart.
-        on_fail        : Optional callable(camera_name) called when a restart attempt fails.
-
-    Example::
-
-        watchdog = FrameHandlerWatchdog(
-            streams={
-                "camera1": "http://127.0.0.1:1984/api/stream.mjpeg?src=camera1",
-                "camera2": "http://127.0.0.1:1984/api/stream.mjpeg?src=camera2",
-            },
-            stale_timeout=10,
-            on_restart=lambda name: print(f"{name} restarted"),
-        )
-        frame = watchdog.get_frame("camera1")   # always returns latest or None
-        watchdog.stop()                          # clean shutdown
-    """
 
     def __init__(
         self,
@@ -292,23 +331,45 @@ class FrameHandlerWatchdog:
         check_interval: float = 3.0,
         on_restart=None,
         on_fail=None,
+        hotplug_queues: "dict[str, _queue_module.Queue] | None" = None,
     ) -> None:
+        """
+        Args:
+            streams        : {camera_name: url} — one entry per camera.
+            stale_timeout  : Seconds without a new frame before declaring a crash (default 10).
+            check_interval : Watchdog polling period in seconds (default 3).
+            on_restart     : Optional callable(camera_name) called after a successful restart.
+            on_fail        : Optional callable(camera_name) called when a restart attempt fails.
+            hotplug_queues : Optional {camera_name: queue.Queue} where each queue carries
+                             {"isConnected": bool} messages from a CameraHotplugHandler.
+                             On disconnect the handler is released immediately and the slot
+                             is held in DISCONNECTED state (no retries) until a connect
+                             message arrives.
+        """
         self._streams        = dict(streams)
         self._stale_timeout  = stale_timeout
         self._check_interval = check_interval
         self._on_restart     = on_restart
         self._on_fail        = on_fail
+        self._hotplug_queues: dict[str, _queue_module.Queue] = dict(hotplug_queues) if hotplug_queues else {}
 
         self._handlers:        dict[str, "FrameHandler | None"] = {}
         self._last_frame_time: dict[str, float]                  = {}
+        self._states:          dict[str, StreamState]            = {}
         self._lock    = threading.Lock()
         self._running = True
 
         # Create initial handlers for all streams
         now = time.monotonic()
         for name, url in self._streams.items():
-            self._handlers[name]        = self._try_create(name, url)
+            self._states[name]          = StreamState.INITIALIZING
+            handler                     = self._try_create(name, url)
+            self._handlers[name]        = handler
             self._last_frame_time[name] = now
+            if handler is not None:
+                self._states[name] = StreamState.LIVE
+            else:
+                self._states[name] = StreamState.CRASHED
 
         self._thread = threading.Thread(
             target=self._watch_loop, daemon=True, name="FrameHandlerWatchdog"
@@ -332,12 +393,39 @@ class FrameHandlerWatchdog:
         """Return all monitored camera names."""
         return list(self._streams.keys())
 
+    def get_state(self, name: str) -> StreamState:
+        """Return the current StreamState for *name*."""
+        with self._lock:
+            return self._states.get(name, StreamState.INITIALIZING)
+
+    def notify_disconnect(self, name: str) -> None:
+        """
+        Signal a physical unplug for *name* directly (no queue required).
+        Immediately releases the FrameHandler and holds the slot in
+        DISCONNECTED state — the watchdog will not retry until
+        notify_connect() is called or a connect message arrives on the queue.
+        Thread-safe.
+        """
+        _watchdog_logger.warning("[Watchdog] notify_disconnect called for %s", name)
+        self._handle_hotplug_disconnect(name)
+
+    def notify_connect(self, name: str) -> None:
+        """
+        Signal that the camera is physically plugged back in for *name*.
+        Transitions the slot from DISCONNECTED → RECONNECTING so the next
+        watchdog cycle will attempt to create a fresh FrameHandler.
+        Thread-safe.
+        """
+        _watchdog_logger.info("[Watchdog] notify_connect called for %s", name)
+        self._handle_hotplug_connect(name)
+
     def stop(self) -> None:
         """Stop the watchdog thread and release all FrameHandlers cleanly."""
         self._running = False
         with self._lock:
             handlers = list(self._handlers.values())
             self._handlers.clear()
+            self._states.clear()
         for fh in handlers:
             if fh is not None:
                 try:
@@ -349,9 +437,14 @@ class FrameHandlerWatchdog:
     # ── internal helpers ───────────────────────────────────────────────────────
 
     def _try_create(self, name: str, url: str) -> "FrameHandler | None":
-        """Attempt to create a new FrameHandler; return None on failure."""
+        """Attempt to create a new FrameHandler; return None on failure.
+
+        Passes max_retries=1 so the open attempt fails fast (≤ 1 s) and the
+        watchdog's own check_interval governs retry pacing.  This avoids
+        5 × 1 s of log spam on every cycle when the stream is not yet up.
+        """
         try:
-            fh = FrameHandler(cameraServerLink=url)
+            fh = FrameHandler(cameraServerLink=url, max_retries=1)
             _watchdog_logger.info("[Watchdog] Handler created for %s", name)
             return fh
         except RuntimeError as exc:
@@ -363,47 +456,76 @@ class FrameHandlerWatchdog:
             time.sleep(self._check_interval)
             if not self._running:
                 break
+            self._drain_hotplug_queues()
             for name, url in list(self._streams.items()):
                 self._check_one(name, url)
 
     def _check_one(self, name: str, url: str) -> None:
         with self._lock:
-            fh = self._handlers.get(name)
+            fh    = self._handlers.get(name)
+            state = self._states.get(name, StreamState.INITIALIZING)
 
         now = time.monotonic()
 
-        # ── handler is None: camera was dead, try to revive it ──────────────
+        # ── DISCONNECTED: physical unplug — hold off until reconnect ────────
+        # _drain_hotplug_queues() will transition this to RECONNECTING when
+        # the connect message arrives; until then do nothing.
+        if state == StreamState.DISCONNECTED:
+            return
+
+        # ── handler is None (crashed / reconnecting / never opened) ─────────
         if fh is None:
             new_fh = self._try_create(name, url)
             with self._lock:
-                self._handlers[name] = new_fh
-                if new_fh is not None:
+                # Guard: a disconnect may have arrived while we were inside
+                # _try_create (which can block up to 5 s × retries).
+                if self._states.get(name) == StreamState.DISCONNECTED:
+                    _watchdog_logger.warning(
+                        "[Watchdog] %s disconnected during handler creation — discarding", name
+                    )
+                    discarded = new_fh
+                    new_fh = None
+                else:
+                    discarded = None
+                    self._handlers[name]        = new_fh
                     self._last_frame_time[name] = now
+                    self._states[name]          = (
+                        StreamState.LIVE if new_fh is not None else StreamState.CRASHED
+                    )
+            # Release outside the lock to avoid holding it during cap.release()
+            if discarded is not None:
+                try:
+                    discarded.release()
+                except Exception:
+                    pass
+                return
             if new_fh is not None:
                 _watchdog_logger.info("[Watchdog] %s recovered after hotplug/crash", name)
                 self._fire(self._on_restart, name)
             else:
-                # Still failing — fire on_fail so the caller can restart ffmpeg/go2rtc.
                 self._fire(self._on_fail, name)
             return
 
-        # ── handler exists: is it still delivering NEW frames? ─────────────
-        # getFrame() always returns the last cached frame (never None after the
-        # first frame), so we check last_received_time instead.
+        # ── handler exists: is it still delivering NEW frames? ──────────────
+        # We use last_received_time (updated by the reader thread on every
+        # successful cap.read()) rather than getFrame() which returns the
+        # last cached frame even when the stream is dead.
         age = now - fh.last_received_time
         if age < self._stale_timeout:
             with self._lock:
                 self._last_frame_time[name] = fh.last_received_time
+                if self._states.get(name) not in (StreamState.DISCONNECTED,):
+                    self._states[name] = StreamState.LIVE
             return
-
-        # No new frame received within stale_timeout — measure staleness
-        stale_for = age
 
         # ── stream crash detected — release old handler and recreate ─────────
         _watchdog_logger.warning(
             "[Watchdog] %s stale for %.1fs (threshold %.1fs) — restarting",
-            name, stale_for, self._stale_timeout,
+            name, age, self._stale_timeout,
         )
+        with self._lock:
+            if self._states.get(name) not in (StreamState.DISCONNECTED,):
+                self._states[name] = StreamState.CRASHED
         try:
             fh.release()
         except Exception:
@@ -411,15 +533,75 @@ class FrameHandlerWatchdog:
 
         new_fh = self._try_create(name, url)
         with self._lock:
-            self._handlers[name] = new_fh
-            self._last_frame_time[name] = now
-
+            if self._states.get(name) == StreamState.DISCONNECTED:
+                discarded = new_fh
+                new_fh = None
+            else:
+                discarded = None
+                self._handlers[name]        = new_fh
+                self._last_frame_time[name] = now
+                self._states[name]          = (
+                    StreamState.LIVE if new_fh is not None else StreamState.CRASHED
+                )
+        if discarded is not None:
+            try:
+                discarded.release()
+            except Exception:
+                pass
+            return
         if new_fh is not None:
             _watchdog_logger.info("[Watchdog] %s restarted successfully", name)
             self._fire(self._on_restart, name)
         else:
             _watchdog_logger.error("[Watchdog] %s restart failed — will retry next cycle", name)
             self._fire(self._on_fail, name)
+
+    def _drain_hotplug_queues(self) -> None:
+        """Process all pending hotplug messages without blocking."""
+        for name, q in self._hotplug_queues.items():
+            while True:
+                try:
+                    msg = q.get_nowait()
+                    if not msg.get("isConnected", True):
+                        self._handle_hotplug_disconnect(name)
+                    else:
+                        self._handle_hotplug_connect(name)
+                except _queue_module.Empty:
+                    break
+
+    def _handle_hotplug_disconnect(self, name: str) -> None:
+        """
+        Immediately release the live FrameHandler and set the slot to
+        DISCONNECTED.  The watchdog will not attempt to recreate the handler
+        until a connect event arrives via the queue or notify_connect().
+        """
+        with self._lock:
+            fh = self._handlers.get(name)
+            self._handlers[name] = None
+            self._states[name]   = StreamState.DISCONNECTED
+        if fh is not None:
+            _watchdog_logger.warning(
+                "[Watchdog] %s DISCONNECTED — releasing FrameHandler", name
+            )
+            try:
+                fh.release()
+            except Exception:
+                pass
+        self._fire(self._on_fail, name)
+
+    def _handle_hotplug_connect(self, name: str) -> None:
+        """
+        Transition the slot from DISCONNECTED → RECONNECTING so the next
+        _watch_loop cycle will call _try_create for this camera.
+        If the slot is not DISCONNECTED the event is a spurious duplicate
+        and is silently ignored.
+        """
+        with self._lock:
+            if self._states.get(name) == StreamState.DISCONNECTED:
+                self._states[name] = StreamState.RECONNECTING
+                _watchdog_logger.info(
+                    "[Watchdog] %s CONNECT received — will create handler on next cycle", name
+                )
 
     @staticmethod
     def _fire(cb, name: str) -> None:
