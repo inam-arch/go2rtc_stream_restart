@@ -167,7 +167,12 @@ class CameraStreamManager:
             return False
 
         with state.lock:
-            # Kill any leftover process first
+            # Already running and alive? Don't touch it.
+            if state.process and state.process.poll() is None:
+                logger.info(f"[StreamManager] {camera_name} already running (PID {state.process.pid})")
+                return True
+
+            # Kill any leftover zombie process
             self._kill_process(state, camera_name)
 
             cfg = state.config
@@ -312,6 +317,10 @@ class CameraStreamManager:
     def get_mjpeg_url(self, camera_name: str) -> str:
         """Return the go2rtc MJPEG URL for this camera."""
         return f"{self.go2rtc_api}/api/stream.mjpeg?src={camera_name}"
+
+    def get_rtsp_url(self, camera_name: str) -> str:
+        """Return the RTSP URL for this camera (preferred for OpenCV)."""
+        return f"{self.rtsp_server}/{camera_name}"
 
     def get_state(self, camera_name: str) -> Optional[CameraState]:
         return self._states.get(camera_name)

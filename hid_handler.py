@@ -5,7 +5,10 @@ from multiprocessing import Queue
 from evdev import InputDevice, ecodes, categorize
 from cds_py_logger import Logger
 from cds_py_hotplug import USB_DEVICES, HOTPLUG
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from frame_handler import FrameHandler
 
 
 @dataclass
@@ -96,6 +99,8 @@ class GenericHidReader(multiprocessing.Process):
         connection_status: Queue,
         device_name: str = "GenericHidHandler",
         logger: Logger=Logger(logger_name="GenericHidReader"),
+        frame_handlers: dict[str, 'FrameHandler'] | None = None,
+        on_barcode_scanned: Callable[[str, dict[str, 'FrameHandler']], None] | None = None,
     ):
         self._logger = logger
         self._logger.info("HID: Init HID Scanner")
@@ -107,6 +112,8 @@ class GenericHidReader(multiprocessing.Process):
             False  # TODO Variable used but never set outside __init__
         )
         self.is_hid_enabled = True
+        self.frame_handlers = frame_handlers or {}
+        self.on_barcode_scanned = on_barcode_scanned
 
         self.hid_data = ""
         self.new_hid_data = ""
@@ -164,6 +171,7 @@ class GenericHidReader(multiprocessing.Process):
                         self._is_data_ready = True
                         self.new_hid_data = self.hid_data
                         self.data_queue.put({"UUID": self.new_hid_data}, block=False)
+                        self._on_scan_complete(self.new_hid_data)
                         self.hid_data = ""
                     else:
                         self.hid_data += HidConstants.SCANCODES[data.scancode]
@@ -187,6 +195,16 @@ class GenericHidReader(multiprocessing.Process):
         self._logger.warning("HID Device Disconnected")
         self.is_connected.value = False
         self.connection_status.put({"isConnected": False}, block=False)
+
+    def _on_scan_complete(self, barcode: str):
+        """Called after a complete barcode is read. Captures frames from all
+        connected cameras and invokes the user callback if provided."""
+        self._logger.info(f"HID: Barcode scanned: {barcode}")
+        if self.on_barcode_scanned and self.frame_handlers:
+            try:
+                self.on_barcode_scanned(barcode, self.frame_handlers)
+            except Exception as error:
+                self._logger.error(f"HID: on_barcode_scanned callback error: {error}")
 
     def _setup_hid(self):
         """

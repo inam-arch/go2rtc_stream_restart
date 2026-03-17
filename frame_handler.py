@@ -76,8 +76,8 @@ class FrameHandler:
     def _open_capture(self) -> cv2.VideoCapture:
         """Open the MJPEG stream with retries. If a stream manager is present
         and the stream is not running, start it before connecting."""
-        max_retries = 5
-        retry_delay = 1
+        max_retries = 10
+        retry_delay = 2
         for attempt in range(1, max_retries + 1):
             cap = cv2.VideoCapture(self.camera_server_link)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -87,13 +87,14 @@ class FrameHandler:
 
             if attempt < max_retries:
                 logger.warning(
-                    f"[FrameHandler] Attempt {attempt} failed to open MJPEG stream. "
+                    f"[FrameHandler] Attempt {attempt}/{max_retries} failed to open MJPEG stream. "
                     f"Retrying in {retry_delay}s..."
                 )
-                # If stream manager available, try starting the stream
+                # If stream manager available, try starting the stream on first failure
                 if self.stream_manager and self.camera_name and attempt == 1:
-                    logger.info(f"[FrameHandler] Requesting stream start for {self.camera_name}")
-                    self.stream_manager.start_stream(self.camera_name)
+                    if not self.stream_manager.is_stream_running(self.camera_name):
+                        logger.info(f"[FrameHandler] Requesting stream start for {self.camera_name}")
+                        self.stream_manager.start_stream(self.camera_name)
                 time.sleep(retry_delay)
             else:
                 raise RuntimeError(
