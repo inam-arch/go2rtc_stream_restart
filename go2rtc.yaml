@@ -27,5 +27,5 @@ log:
 streams:
   # Pre-declare slots so the Web UI and API show the stream names.
   # ffmpeg pushes RTSP here; go2rtc re-serves via RTSP / WebRTC / HLS.
-  camera1: []
-  camera2: []
+  camera1: 
+  camera2: 

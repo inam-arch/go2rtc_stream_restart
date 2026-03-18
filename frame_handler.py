@@ -2,6 +2,7 @@ import enum
 import logging
 import queue as _queue_module
 import threading
+from typing import Optional, Dict, Tuple, List
 from flask_socketio import SocketIO
 import cv2
 import datetime
@@ -25,15 +26,15 @@ class FrameHandler:
 
     def __init__(
             self,
-            flaskSocketIo: SocketIO | None = None,
+            flaskSocketIo: Optional[SocketIO] = None,
             channelName: str = "frame",
             roomId: int = 122,
             cameraServerLink: str = "http://127.0.0.1:1984/api/stream.mjpeg?src=inspect",
             saveVideo: bool = False,
             enableResize: bool = False,
             videoFPS: int = 30,
-            imageResolution: tuple[int, int] = (2464, 2056),
-            videoResolution: tuple[int, int] = (640, 540),
+            imageResolution: Tuple[int, int] = (2464, 2056),
+            videoResolution: Tuple[int, int] = (640, 540),
             max_retries: int = 5,
             ):
         """
@@ -61,7 +62,7 @@ class FrameHandler:
         self.save_in_progress = False
         self.last_frame = None
         self.last_timestamp = None
-        self.videoSavingLoop: threading.Thread | None = None
+        self.videoSavingLoop: Optional[threading.Thread] = None
 
         self._is_http = self.camera_server_link.startswith(("http://", "https://"))
 
@@ -236,7 +237,7 @@ class FrameHandler:
             return
         self.out.write(frame) # type: ignore
 
-    def getAndSaveFrame(self, imagePath: str, wait_for_latest: bool = False) -> cv2.typing.MatLike | None:
+    def getAndSaveFrame(self, imagePath: str, wait_for_latest: bool = False) -> Optional[cv2.typing.MatLike]:
         frame = self.getFrame(wait_for_latest)
         if frame is not None:
             cv2.imwrite(imagePath, frame)
@@ -252,7 +253,7 @@ class FrameHandler:
                     return False
         return True
 
-    def getFrame(self, wait_for_latest: bool = False) -> cv2.typing.MatLike | None:
+    def getFrame(self, wait_for_latest: bool = False) -> Optional[cv2.typing.MatLike]:
         frame = None
         if wait_for_latest:
             # Block until we get a frame
@@ -326,12 +327,12 @@ class FrameHandlerWatchdog:
 
     def __init__(
         self,
-        streams: dict[str, str],
+        streams: Dict[str, str],
         stale_timeout: float = 10.0,
         check_interval: float = 3.0,
         on_restart=None,
         on_fail=None,
-        hotplug_queues: "dict[str, _queue_module.Queue] | None" = None,
+        hotplug_queues: Optional[Dict[str, _queue_module.Queue]] = None,
     ) -> None:
         """
         Args:
@@ -351,11 +352,11 @@ class FrameHandlerWatchdog:
         self._check_interval = check_interval
         self._on_restart     = on_restart
         self._on_fail        = on_fail
-        self._hotplug_queues: dict[str, _queue_module.Queue] = dict(hotplug_queues) if hotplug_queues else {}
+        self._hotplug_queues: Dict[str, _queue_module.Queue] = dict(hotplug_queues) if hotplug_queues else {}
 
-        self._handlers:        dict[str, "FrameHandler | None"] = {}
-        self._last_frame_time: dict[str, float]                  = {}
-        self._states:          dict[str, StreamState]            = {}
+        self._handlers:        Dict[str, Optional["FrameHandler"]] = {}
+        self._last_frame_time: Dict[str, float]                  = {}
+        self._states:          Dict[str, StreamState]            = {}
         self._lock    = threading.Lock()
         self._running = True
 
@@ -379,7 +380,7 @@ class FrameHandlerWatchdog:
 
     # ── public interface ───────────────────────────────────────────────────────
 
-    def get_handler(self, name: str) -> "FrameHandler | None":
+    def get_handler(self, name: str) -> Optional["FrameHandler"]:
         """Return the current live FrameHandler for *name*, or None if crashed."""
         with self._lock:
             return self._handlers.get(name)
@@ -389,7 +390,7 @@ class FrameHandlerWatchdog:
         fh = self.get_handler(name)
         return fh.getFrame() if fh is not None else None
 
-    def camera_names(self) -> list[str]:
+    def camera_names(self) -> List[str]:
         """Return all monitored camera names."""
         return list(self._streams.keys())
 
@@ -436,7 +437,7 @@ class FrameHandlerWatchdog:
 
     # ── internal helpers ───────────────────────────────────────────────────────
 
-    def _try_create(self, name: str, url: str) -> "FrameHandler | None":
+    def _try_create(self, name: str, url: str) -> Optional["FrameHandler"]:
         """Attempt to create a new FrameHandler; return None on failure.
 
         Passes max_retries=1 so the open attempt fails fast (≤ 1 s) and the

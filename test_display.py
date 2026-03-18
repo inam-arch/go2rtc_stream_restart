@@ -19,6 +19,7 @@ import os
 import re
 import time
 import tkinter as tk
+from typing import Dict, List
 
 import cv2
 import numpy as np
@@ -33,8 +34,19 @@ def _rtsp_host() -> str:
     On Windows: localhost.
     On WSL2 (NAT mode): read Windows host IP from /etc/resolv.conf.
     On WSL2 (mirrored mode): localhost also works.
+    On native Linux: localhost.
     """
-    if os.path.exists("/etc/resolv.conf") and not os.path.exists("C:/Windows"):
+    # Check if running on WSL (look for microsoft in kernel release or /proc/sys/kernel/osrelease)
+    is_wsl = False
+    try:
+        with open("/proc/sys/kernel/osrelease") as f:
+            if "microsoft" in f.read().lower() or "wsl" in f.read().lower():
+                is_wsl = True
+    except OSError:
+        pass
+    
+    # Only try to read nameserver if on WSL
+    if is_wsl and os.path.exists("/etc/resolv.conf"):
         try:
             with open("/etc/resolv.conf") as fh:
                 for line in fh:
@@ -49,7 +61,7 @@ RTSP_BASE = f"rtsp://{_rtsp_host()}:8554"
 
 # RTSP URLs — go2rtc exposes each stream on port 8554/<stream_name>.
 # cv2.VideoCapture handles RTSP natively on Windows via the FFmpeg backend.
-CAMERAS: dict[str, str] = {
+CAMERAS: Dict[str, str] = {
     "camera1": f"{RTSP_BASE}/camera1",
     "camera2": f"{RTSP_BASE}/camera2",
 }
@@ -61,7 +73,7 @@ STALE_TIMEOUT  = 5.0   # seconds without a frame → watchdog restarts handler
 CHECK_INTERVAL = 2.0    # watchdog polling interval in seconds
 
 # Colour per stream state (shown as a coloured dot next to the state label)
-_STATE_COLOUR: dict[StreamState, str] = {
+_STATE_COLOUR: Dict[StreamState, str] = {
     StreamState.INITIALIZING : "#cccc00",
     StreamState.LIVE         : "#00cc44",
     StreamState.CRASHED      : "#ff6600",
@@ -95,20 +107,20 @@ class StreamDisplayGUI:
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Per-camera widgets and bookkeeping
-        self._canvases:    dict[str, tk.Canvas]          = {}
-        self._img_ids:     dict[str, int]                = {}
-        self._photos:      dict[str, ImageTk.PhotoImage] = {}
-        self._state_var:   dict[str, tk.StringVar]       = {}
-        self._state_lbl:   dict[str, tk.Label]           = {}
-        self._status_var:  dict[str, tk.StringVar]       = {}
+        self._canvases:    Dict[str, tk.Canvas]          = {}
+        self._img_ids:     Dict[str, int]                = {}
+        self._photos:      Dict[str, ImageTk.PhotoImage] = {}
+        self._state_var:   Dict[str, tk.StringVar]       = {}
+        self._state_lbl:   Dict[str, tk.Label]           = {}
+        self._status_var:  Dict[str, tk.StringVar]       = {}
         # Rolling timestamp list for FPS estimation
-        self._frame_times: dict[str, list[float]]        = {}
+        self._frame_times: Dict[str, List[float]]        = {}
 
         self._build_ui(sorted(watchdog.camera_names()))
 
     # ── UI construction ────────────────────────────────────────────────────────
 
-    def _build_ui(self, cam_names: list[str]) -> None:
+    def _build_ui(self, cam_names: List[str]) -> None:
         ncols = max(len(cam_names), 1)
         win_w = ncols * (DISPLAY_W + 20) + 20
         win_h = DISPLAY_H + 110
