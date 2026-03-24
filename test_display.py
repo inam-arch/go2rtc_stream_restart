@@ -1,7 +1,7 @@
 """
 test_display.py — Live stream display GUI.
 
-Displays frames from all cameras managed by a FrameHandlerWatchdog.
+Displays frames from all cameras managed by individual FrameHandler instances.
 No stream-management logic lives here — this file only reads frames
 and paints them on screen.
 
@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from frame_handler import FrameHandlerWatchdog, StreamState
+from frame_handler import FrameHandler
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -69,17 +69,8 @@ CAMERAS: Dict[str, str] = {
 DISPLAY_W      = 640    # pixels per video tile
 DISPLAY_H      = 480
 UPDATE_MS      = 66     # ~15 fps refresh (light on the main thread)
-STALE_TIMEOUT  = 5.0   # seconds without a frame → watchdog restarts handler
+STALE_TIMEOUT  = 5.0   # seconds without a frame → watchdog restarts reader
 CHECK_INTERVAL = 2.0    # watchdog polling interval in seconds
-
-# Colour per stream state (shown as a coloured dot next to the state label)
-_STATE_COLOUR: Dict[StreamState, str] = {
-    StreamState.INITIALIZING : "#cccc00",
-    StreamState.LIVE         : "#00cc44",
-    StreamState.CRASHED      : "#ff6600",
-    StreamState.DISCONNECTED : "#cc0000",
-    StreamState.RECONNECTING : "#0088ff",
-}
 
 
 # ── GUI ────────────────────────────────────────────────────────────────────────
@@ -89,15 +80,14 @@ class StreamDisplayGUI:
     One tile per camera.  Each tile shows:
       - Camera name header
       - Live video canvas (BGR frames converted to RGB for Tkinter)
-      - State indicator (coloured dot + state name)
       - Status bar: frame shape and rolling FPS
 
-    All stream management is handled externally by FrameHandlerWatchdog.
-    This class only reads frames and state via the public watchdog API.
+    All stream management is handled by individual FrameHandler instances.
+    This class only reads frames via getFrame().
     """
 
-    def __init__(self, watchdog: FrameHandlerWatchdog) -> None:
-        self._watchdog = watchdog
+    def __init__(self, handlers: Dict[str, FrameHandler]) -> None:
+        self._handlers = handlers
         self._closing  = False
 
         self._root = tk.Tk()
@@ -110,13 +100,11 @@ class StreamDisplayGUI:
         self._canvases:    Dict[str, tk.Canvas]          = {}
         self._img_ids:     Dict[str, int]                = {}
         self._photos:      Dict[str, ImageTk.PhotoImage] = {}
-        self._state_var:   Dict[str, tk.StringVar]       = {}
-        self._state_lbl:   Dict[str, tk.Label]           = {}
         self._status_var:  Dict[str, tk.StringVar]       = {}
         # Rolling timestamp list for FPS estimation
         self._frame_times: Dict[str, List[float]]        = {}
 
-        self._build_ui(sorted(watchdog.camera_names()))
+        self._build_ui(sorted(handlers.keys()))
 
     # ── UI construction ────────────────────────────────────────────────────────
 
@@ -147,17 +135,6 @@ class StreamDisplayGUI:
             canvas.pack(padx=4)
             self._canvases[name] = canvas
 
-            # State indicator line
-            state_var = tk.StringVar(value="● INITIALIZING")
-            self._state_var[name] = state_var
-            state_lbl = tk.Label(
-                outer, textvariable=state_var,
-                fg=_STATE_COLOUR[StreamState.INITIALIZING],
-                bg="#1e1e1e", font=("Segoe UI", 9, "bold"),
-            )
-            state_lbl.pack(pady=(4, 0))
-            self._state_lbl[name] = state_lbl
-
             # Status bar (shape + FPS)
             status_var = tk.StringVar(value="Waiting for frames…")
             self._status_var[name] = status_var
@@ -173,20 +150,15 @@ class StreamDisplayGUI:
     def _tick(self) -> None:
         if self._closing:
             return
-        for name in self._state_var:
+        for name in self._status_var:
             self._update_tile(name)
         self._root.after(UPDATE_MS, self._tick)
 
     def _update_tile(self, name: str) -> None:
-        state  = self._watchdog.get_state(name)
-        frame  = self._watchdog.get_frame(name)
+        fh     = self._handlers[name]
+        frame  = fh.getFrame()
         canvas = self._canvases[name]
         now    = time.monotonic()
-
-        # ── state indicator ────────────────────────────────────────────────
-        colour = _STATE_COLOUR.get(state, "#888888")
-        self._state_var[name].set(f"● {state.value.upper()}")
-        self._state_lbl[name].config(fg=colour)
 
         # ── video frame ────────────────────────────────────────────────────
         if frame is not None:
@@ -230,16 +202,21 @@ class StreamDisplayGUI:
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    watchdog = FrameHandlerWatchdog(
-        streams=CAMERAS,
-        stale_timeout=STALE_TIMEOUT,
-        check_interval=CHECK_INTERVAL,
-    )
-    gui = StreamDisplayGUI(watchdog=watchdog)
+    handlers: Dict[str, FrameHandler] = {
+        name: FrameHandler(
+            name=name,
+            cameraServerLink=url,
+            stale_timeout=STALE_TIMEOUT,
+            check_interval=CHECK_INTERVAL,
+        )
+        for name, url in CAMERAS.items()
+    }
+    gui = StreamDisplayGUI(handlers=handlers)
     try:
         gui.run()
     finally:
-        watchdog.stop()
+        for fh in handlers.values():
+            fh.release()
 
 
 if __name__ == "__main__":
