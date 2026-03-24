@@ -2,17 +2,22 @@ import logging
 import multiprocessing as _mp
 import queue as _queue_module
 import threading
-from typing import Any, Optional, Dict, Tuple, List
+from typing import Any, Optional, Dict, Tuple
 from flask_socketio import SocketIO
 import cv2
 import datetime
 import ffmpegcv
 import math
-import numpy as _np
 import pytz
 import time
-from cds_py_logger import Logger
-from cds_py_hotplug import USB_DEVICES, HOTPLUG
+
+# Optional hotplug deps (Linux-only: udev-based USB monitoring)
+try:
+    from cds_py_logger import Logger as _HotplugLogger
+    from cds_py_hotplug import USB_DEVICES as _USB_DEVICES, HOTPLUG as _HOTPLUG
+    _HOTPLUG_AVAILABLE = True
+except ImportError:
+    _HOTPLUG_AVAILABLE = False
 
 
 _logger = logging.getLogger("FrameHandler")
@@ -41,8 +46,8 @@ class _CameraHotplugProcess(_mp.Process):
         # Defer heavy setup to run() so it happens inside the child process.
 
     def run(self) -> None:
-        logger = Logger(logger_name="CameraHotplug")
-        camera_device = USB_DEVICES(
+        logger = _HotplugLogger(logger_name="CameraHotplug")
+        camera_device = _USB_DEVICES(
             name=self._config.get("device_name", "Camera"),
             vendor_id=self._config["vid"],
             product_id=self._config["pid"],
@@ -51,7 +56,7 @@ class _CameraHotplugProcess(_mp.Process):
             disconnection_cb=self._on_disconnect,
             logger_object=logger,
         )
-        hotplug = HOTPLUG(logger_object=logger)
+        hotplug = _HOTPLUG(logger_object=logger)
         hotplug.register_device(camera_device)
 
         # Probe initial state
@@ -76,7 +81,6 @@ class _CameraHotplugProcess(_mp.Process):
 
 
 class FrameHandler:
-    LATEST_FRAME_TIMEOUT = 1 # seconds
 
     def __init__(
             self,
@@ -123,7 +127,6 @@ class FrameHandler:
         self.channelName = channelName
         self.room_id = roomId
         self.camera_server_link = cameraServerLink
-        self.save_video = saveVideo
         self.enableResize = enableResize
         self.videoFPS = videoFPS
         self.imageResolution = imageResolution
@@ -181,14 +184,20 @@ class FrameHandler:
         # Auto-create hotplug monitor when config is provided and no external
         # queue was passed in.
         if hotplug_config is not None and hotplug_queue is None:
-            hp_queue: _mp.Queue = _mp.Queue()
-            self._hotplug_queue = hp_queue
-            self._hotplug_process = _CameraHotplugProcess(
-                config=hotplug_config,
-                connection_status=hp_queue,
-            )
-            self._hotplug_process.start()
-            _logger.info("[FrameHandler] Hotplug monitor started for %s", self.name or self.camera_server_link)
+            if not _HOTPLUG_AVAILABLE:
+                _logger.warning(
+                    "[FrameHandler] hotplug_config provided but cds_py_hotplug "
+                    "is not installed — hotplug monitoring disabled"
+                )
+            else:
+                hp_queue: _mp.Queue = _mp.Queue()
+                self._hotplug_queue = hp_queue
+                self._hotplug_process = _CameraHotplugProcess(
+                    config=hotplug_config,
+                    connection_status=hp_queue,
+                )
+                self._hotplug_process.start()
+                _logger.info("[FrameHandler] Hotplug monitor started for %s", self.name or self.camera_server_link)
 
         self._disconnected = False
         self._wd_running = enable_watchdog
@@ -431,21 +440,14 @@ class FrameHandler:
             cv2.imwrite(imagePath, frame)
         return frame
 
-    def check_camera_connection(self) -> bool:
-        if self.getFrame() is None:
-            attempt = 0
-            while self.getFrame() is None:
-                time.sleep(1)
-                attempt += 1
-                if attempt > 30:
-                    return False
-        return True
-
-    def getFrame(self, wait_for_latest: bool = False) -> Optional[cv2.typing.MatLike]:
+    def getFrame(self, wait_for_latest: bool = False, timeout: float = 5.0) -> Optional[cv2.typing.MatLike]:
         frame = None
         if wait_for_latest:
             self.is_latest_frame_available = False
+            deadline = time.monotonic() + timeout
             while not self.is_latest_frame_available:
+                if time.monotonic() >= deadline:
+                    return None
                 time.sleep(0.001)
             with self.frame_lock:
                 if self.latest_frame is not None:
