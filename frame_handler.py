@@ -441,11 +441,14 @@ class FrameHandler:
                     return False
         return True
 
-    def getFrame(self, wait_for_latest: bool = False) -> Optional[cv2.typing.MatLike]:
+    def getFrame(self, wait_for_latest: bool = False, timeout: float = 5.0) -> Optional[cv2.typing.MatLike]:
         frame = None
         if wait_for_latest:
             self.is_latest_frame_available = False
+            deadline = time.monotonic() + timeout
             while not self.is_latest_frame_available:
+                if time.monotonic() >= deadline:
+                    return None
                 time.sleep(0.001)
             with self.frame_lock:
                 if self.latest_frame is not None:
